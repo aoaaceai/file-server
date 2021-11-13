@@ -1,0 +1,11 @@
+# steps of connectiing
+- server listen
+- client connect
+- server waits for username
+- server waits for command
+    - ls: `0 []`
+        - immediately respond, wait for command again
+    - get `1 []`
+        - put into queue
+    - put `2 []`
+    - other
