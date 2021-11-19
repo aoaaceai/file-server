@@ -43,6 +43,10 @@ struct work {
 unordered_set<string> current_users;
 unordered_map<int, string> fd_to_name;
 unordered_map<int, work> fd_to_work;
+unordered_map<int, string> fd_to_filename;
+unordered_map<state, int> state_to_poll = {
+    {ACCEPT_CONNECTION, POLLIN}, {READ_USERNAME, POLLIN}, {READ_COMMAND, POLLIN}, {WRITE_DATA, POLLOUT}
+};
 
 void bad_usage(char *progname) {
     cerr << "Usage: " << progname << " [port]\n";
@@ -91,59 +95,86 @@ void request_write(int conn_fd, work_method method, int data_fd, char *buf, size
     add_queue(conn_fd, POLLOUT, WRITE_DATA);
 }
 
+void handle_logout(int fd) {
+    if(fd_to_name.count(fd)) {
+        current_users.erase(fd_to_name[fd]);
+        fd_to_name.erase(fd);
+    }
+    fd_to_work.erase(fd);
+    close(fd);
+}
+
 void handle_write(int conn_fd) {
-    cerr << "handle write\n";
-    fcntl(conn_fd, F_SETFL, fcntl(conn_fd, F_GETFL) | O_NONBLOCK);
+    cerr << "handle write to " << conn_fd << '\n';
     work w = fd_to_work[conn_fd];
     fd_to_work.erase(conn_fd);
     if(w.method == FROM_BUF) {
-        ssize_t res = write(w.fd, w.buf + w.progress, w.buffsize - w.progress);
+        ssize_t res = write(conn_fd, w.buf + w.progress, w.buffsize - w.progress);
         if(res < 0) {
             perror("write to remote");
-            fcntl(conn_fd, F_SETFL, fcntl(conn_fd, F_GETFL) | ~O_NONBLOCK);
+            handle_logout(conn_fd);
             return;
         }
         w.progress += res;
     }
-    else if(w.method == FROM_FD) {
+    else {
+        if(w.progress == 0) {
+            off_t sz = lseek(w.fd, 0, SEEK_END);
+            w.buffsize = sz;
+            FILE *remote = fdopen(dup(conn_fd), "r+");
+            setvbuf(remote, NULL, _IONBF, 0);
+            fprintf(remote, "%d\n", sz);
+            fclose(remote);
+        }
         char buf[1024];
         ssize_t res = pread(w.fd, buf, 1024, w.progress);
         if(res < 0) {
             perror("read from file");
-            fcntl(conn_fd, F_SETFL, fcntl(conn_fd, F_GETFL) & ~O_NONBLOCK);
             return;
         }
-        res = write(w.fd, buf, res);
+        cerr << "bytes read: " << res << '\n';
+        res = write(conn_fd, buf, res);
         if(res < 0) {
             perror("write to remote");
-            fcntl(conn_fd, F_SETFL, fcntl(conn_fd, F_GETFL) & ~O_NONBLOCK);
+            handle_logout(conn_fd);
             return;
         }
+        cerr << "bytes wrote: " << res << '\n';
         w.progress += res;
     }
-    fcntl(conn_fd, F_SETFL, fcntl(conn_fd, F_GETFL) & ~O_NONBLOCK);
-    if(w.progress < w.buffsize) fd_to_work[conn_fd] = w;
-    else delete w.buf;
+    if(w.progress < w.buffsize) {
+        fd_to_work[conn_fd] = w;
+        add_queue(conn_fd, POLLOUT, WRITE_DATA);
+        cerr << conn_fd << " requested another write\n";
+
+    }
+    else {
+        delete w.buf;
+        add_queue(conn_fd, state_to_poll[w.next_state], w.next_state);
+        cerr << conn_fd << " next state: " << w.next_state << '\n';
+    }
 }
 
 void accept_connection() {
     int fd = accept(server.fd, (sockaddr *)&server.addr, &server.addrlen);
     add_queue(fd, POLLIN, READ_USERNAME);
+    cerr << "fd " << fd << " accepted\n";
+}
+
+void strip(string &s) {
+    int len = s.size();
+    for(int i = 0; i < len; ++i) if(!isalnum(s[i])) {
+        s.resize(i);
+        return;
+    }
 }
 
 bool valid_username(string &s) {
-    if(s.length() <= 2) return false;
-    for(char c : s) {
-        if(c == '\r') return true;
-        else if(!isalnum(c)) {
-            // cerr << (int) c << '\n';
-            return false;
-        }
-    }
-    return true;
+    return s.size() > 0;
 }
 
 void handle_login(int fd) {
+    cerr << "handle login\n";
     char buf[1024];
     ssize_t size = read(fd, buf, 1024);
     if(size < 0) {
@@ -153,53 +184,74 @@ void handle_login(int fd) {
     }
     buf[size] = '\0';
     string username = buf;
+    strip(username);
     if(!valid_username(username)) {
-        write(fd, "login BADNAME\n", 14);
+        write(fd, "BADNAME\n", 8);
         close(fd);
         return;
     }
     if(current_users.count(username)) {
-        write(fd, "login USED\n", 11);
-        close(fd);
+        write(fd, "USED\n", 5);
+        add_queue(fd, POLLIN, READ_USERNAME);
         return;
     }
+    cerr << "got new user " << username << '\n';
     current_users.insert(username);
     fd_to_name[fd] = username;
-    write(fd, "login SUCCESS\n", 14);
+    write(fd, "SUCCESS\n", 8);
     add_queue(fd, POLLIN, READ_COMMAND);
 }
 
-void handle_logout() {
-    // TODO
-}
 
 void handle_bad_request(int fd) {
     cerr << "bad request from " << fd << '\n';
-    // TODO
+    handle_logout(fd);
 }
 
 void ls(int fd) {
+    cerr << "processing ls\n";
     vector<string> dirs;
-    for(auto entry : filesystem::directory_iterator("server_dir")) dirs.push_back((string)entry.path());
+    for(auto entry : filesystem::directory_iterator(".")) dirs.push_back(entry.path().c_str()+2);
     sort(dirs.begin(), dirs.end());
     string content = to_string(dirs.size()) + '\n';
     for(auto d : dirs) content += d + '\n';
     size_t buffsize = content.size();
     char *buf = new char[buffsize];
     strcpy(buf, content.c_str());
-    request_write(fd, FROM_BUF, 0, buf, buffsize, READ_COMMAND);
+    request_write(fd, FROM_BUF, -1, buf, buffsize, READ_COMMAND);
+}
+
+void dump_file(int fd, char *filename) {
+    int data_fd = open(filename, O_RDONLY);
+    request_write(fd, FROM_FD, data_fd, NULL, 0, READ_COMMAND);
+}
+
+void get(int fd, char *filename) {
+    cerr << "checking " << filename << ", len: " << strlen(filename) << '\n';
+    struct stat buf;
+    if(stat(filename, &buf) == 0) {
+        dump_file(fd, filename);
+    }
+    else {
+        char *header = new char[5];
+        int len = sprintf(header, "%d\n", -1);
+        request_write(fd, FROM_BUF, -1, header, len, READ_COMMAND);
+    }
 }
 
 void read_command(int fd) {
+    // cerr << "reading command\n";
     char input[512], filename[512];
     read(fd, input, 512);
     command choice;
-    sscanf(input, "%d%s", &choice, filename);
+    sscanf(input, "%d %[^\r\n]\n", &choice, filename);
+    // cerr << "got command input " << choice << '\n';
     switch(choice) {
         case LS:
         ls(fd);
         break;
         case GET:
+        get(fd, filename);
         break;
         case PUT:
         break;
@@ -210,13 +262,31 @@ void read_command(int fd) {
 
 void dir_init() {
     mkdir("server_dir", 0755);
+    chdir("server_dir");
+}
+
+void server_cleanup(int var) {
+    close(server.fd);
+    exit(0);
+}
+
+void hangup(int var) {
+    cerr << "SIGHUP received\n";
+}
+
+void broken_pipe(int var) {
+    cerr << "SIGPIPE received\n";
 }
 
 int main(int argc, char **argv) {
     server_init(argc, argv);
     queue_init();
     dir_init();
+    signal(SIGINT, server_cleanup);
+    signal(SIGHUP, hangup);
+    signal(SIGPIPE, broken_pipe);
     while(true) {
+        cerr << "poll size: " << poll_queue.size << '\n';
         if(poll(poll_queue.polls, poll_queue.size, -1) < 0) perror("polling");
         short revents;
         for(int i = 0; i < poll_queue.size; ++i) if(revents = poll_queue.polls[i].revents) {
@@ -226,6 +296,7 @@ int main(int argc, char **argv) {
                 accept_connection();
                 continue;
             }
+            // cerr << "got event from " << poll_queue.polls[i].fd << '\n';
             switch(poll_queue.states[i]) {
                 case ACCEPT_CONNECTION:
                 accept_connection();
@@ -239,6 +310,8 @@ int main(int argc, char **argv) {
                 case WRITE_DATA:
                 handle_write(poll_queue.polls[i].fd);
                 break;
+                default:
+                cerr << "unrecognised state " << poll_queue.states[i] << " from " << poll_queue.polls[i].fd << '\n';
             }
             remove_queue(i--);
         }
