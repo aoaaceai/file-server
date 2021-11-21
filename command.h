@@ -1,3 +1,3 @@
 enum command {
-    LS, GET, PUT
+    LS, GET, PUT, BAD_COMMAND
 };
