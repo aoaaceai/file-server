@@ -302,17 +302,17 @@ void read_command(int fd) {
     char input[512], filename[512];
     read(fd, input, 512);
     command choice = BAD_COMMAND;
-    sscanf(input, "%d %[^\r\n]\n", &choice, filename);
-    int cnt;
+    int cnt = sscanf(input, "%d %[^\r\n]\n", &choice, filename);
     cerr << "got command input " << choice << '\n';
     switch(choice) {
         case LS:
-        ls(fd);
+        cnt == 1 ? ls(fd) : handle_bad_request(fd);
         break;
         case GET:
-        get(fd, filename);
+        cnt == 2 ? get(fd, filename) : handle_bad_request(fd);
         break;
         case PUT:
+        if(cnt != 2) break;
         char buf[512];
         cnt = sprintf(buf, "%d %s\n", choice, filename);
         put(fd, filename, atoll(input+cnt));
