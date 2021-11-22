@@ -15,6 +15,11 @@ struct {
     socklen_t addrlen;
 } client;
 
+void dir_init() {
+    mkdir("client_dir", 0755);
+    chdir("client_dir");
+}
+
 void bad_usage(char *progname) {
     cerr << "Usage: " << progname << " [ip:port]\n";
     exit(1);
@@ -39,7 +44,7 @@ void close_connection(int status) {
 }
 
 void handle_login() {
-    cout << "input your username:\n";
+    printf("input your username:\n");
     while(true) {
         char buf[512], username[9];
         fgets(buf, 512, stdin);
@@ -52,16 +57,15 @@ void handle_login() {
         }
         switch(*buf) {
             case 'S':
-            cout << "connect successfully\n";
+            printf("connect successfully\n");
             return;
             case 'B':
-            cerr << "bad username.";
-            close_connection(1);
+            cerr << "bad username";
             case 'U':
-            cout << "username is in used, please try another:\n";
+            printf("username is in used, please try another:\n");
             break;
             default:
-            cerr << "unrecognised response " << (int) *buf << '\n';
+            cerr << "unrecognised response " << buf << '\n';
             close_connection(1);
         }
     }
@@ -71,20 +75,20 @@ void ls() {
     FILE *remote = fdopen(dup(client.fd), "r+");
     fprintf(remote, "%d\n", LS);
     int len;
-    fscanf(remote, "%d\n", &len);
-    // cerr << "len: " << len << '\n';
+    char buf[512];
+    fgets(buf, 512, remote);
+    sscanf(buf, "%d\n", &len);
     for(int i = 0; i < len; ++i) {
-        char buf[512];
         fgets(buf, sizeof(buf), remote);
-        cout << buf;
+        printf("%s", buf);
     }
     fclose(remote);
 }
 
 int get(int fd, size_t size) {
-    long long progress = 0;
+    size_t progress = 0;
     char checksum = 0, last_byte = 0;
-    while(progress < size) {
+    while(progress <= size) {
         char buf[1024];
         int res = read(client.fd, buf, sizeof(buf));
         if(res < 0) {
@@ -94,9 +98,7 @@ int get(int fd, size_t size) {
         for(int i = 0; i < res; ++i) checksum ^= buf[i];
         write(fd, buf, res);
         progress += res;
-        cerr << progress << '\n';
         last_byte = buf[res-1];
-        cerr << "last byte: " << (int) last_byte << '\n';
     }
     checksum ^= last_byte;
     return checksum == last_byte;
@@ -106,40 +108,53 @@ void get_wrapper(char *filename) {
     FILE *remote = fdopen(dup(client.fd), "r+");
     setvbuf(remote, NULL, _IONBF, 0);
     fprintf(remote, "%d %s\n", GET, filename);
-    off_t size;
+    off_t size = -1;
     fscanf(remote, "%lld", &size);
-    fclose(remote);
-    cerr << "file size: " << size << '\n';
     if(size < 0) {
-        cout << "The " << filename << " doesn't exist\n";
+        printf("The %s doesn't exist\n", filename);
         return;
     }
-    int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    else if(size == 0) {
+        cerr << "zero file size\n";
+        int fd = open(filename, O_CREAT | O_TRUNC, 0600);
+        close(fd);
+        printf("get %s successfully\n", filename);
+        return;
+    }
+    cerr << "file size: " << size << '\n';
+    int fd = open(filename, O_CREAT | O_TRUNC | O_WRONLY, 0600);
     while(true) {
         int res = get(fd, size);
-        if(res < 0) return;
+        if(res < 0) {
+            close(fd);
+            return;
+        }
         if(res) break;
         ftruncate(fd, 0);
         cerr << "get failed\n";
     }
     ftruncate(fd, size);
     close(fd);
-    cout << "get " << filename << " successfully\n";
+    printf("get %s successfully\n", filename);
 }
 
 int put(int fd) {
     char buf[1024];
+    // "go on" from remote
     read(client.fd, buf, 512);
     lseek(fd, 0, SEEK_SET);
     ssize_t count;
     char checksum = 0;
     while((count = read(fd, buf, 1024)) > 0) {
+        cerr << "read\n";
         int res = write(client.fd, buf, count);
+        cerr << "write\n";
         if(res < 0) {
             perror("write to remote");
             return -1;
         }
         for(int i = 0; i < res; ++i) checksum ^= buf[i];
+        cerr << res << ' ' << (int) checksum << '\n';
     }
     char remote_checksum;
     read(client.fd, &remote_checksum, 1);
@@ -149,61 +164,62 @@ int put(int fd) {
 void put_wrapper(char *filename) {
     int fd = open(filename, O_RDONLY);
     if(fd < 0) {
-        cout << "The " << filename << " doesn't exist\n";
+        printf("The %s doesn't exist\n", filename);
         return;
     }
     FILE *remote = fdopen(dup(client.fd), "w");
     setvbuf(remote, NULL, _IONBF, 0);
-    fprintf(remote, "%d %s\n%lld\n", PUT, filename, lseek(fd, 0, SEEK_END));
+    off_t filesize = lseek(fd, 0, SEEK_END);
+    fprintf(remote, "%d %s\n%lld\n", PUT, filename, filesize);
     fclose(remote);
+    if(filesize == 0) {
+        cerr << "zero file size\n";
+        printf("put %s successfully\n", filename);
+        return;
+    }
     while(true) {
         int res = put(fd);
-        if(res < 0) return;
+        if(res < 0) {
+            close(fd);
+            return;
+        }
         if(res) break;
         cerr << "put failed\n";
     }
-    cout << "put " << filename << " successfully\n";
+    printf("put %s successfully\n", filename);
 }
 
 void bad_format() {
-    cout << "Command format error\n";
+    printf("Command format error\n");
 }
 
 void handle_command() {
     while(true) {
-        char command[100], filename[100], line[100];
+        char command[100], filename[100], line[100] = {0}, buf[100];
         fgets(line, 100, stdin);
-        int count = sscanf(line, "%s %[^\n]", command, filename);
-        if(strcmp(command, "ls") == 0) {
-            if(count != 1) {
-                bad_format();
-                continue;
-            }
-            ls();
+        int count = sscanf(line, "%s%s", command, filename);
+        if(count < 0) break;
+        else if(!strcmp(command, "ls")) {
+            count == 1 ? ls() : bad_format();
         }
-        else if(strcmp(command, "get") == 0) {
-            if(count != 2) {
-                bad_format();
-                continue;
-            }
-            get_wrapper(filename);
+        else if(!strcmp(command, "get")) {
+            count == 2 && strlen(line) == sprintf(buf, "%s %s\n", command, filename) ? get_wrapper(filename) : bad_format();
         }
-        else if(strcmp(command, "put") == 0) {
-            if(count != 2) {
-                bad_format();
-                continue;
-            }
-            put_wrapper(filename);
+        else if(!strcmp(command, "put")) {
+            count == 2 && strlen(line) == sprintf(buf, "%s %s\n", command, filename) ? put_wrapper(filename) : bad_format();
         }
-        else {
-            cout << "Command not found\n";
-        }
+        else printf("Command not found\n");
     }
 }
 
+void client_cleanup(int var) {
+    cerr << "SIGINT received\n";
+    close_connection(0);
+}
+
 int main(int argc, char **argv) {
-    mkdir("client_dir", 0755);
-    chdir("client_dir");
+    dir_init();
+    signal(SIGINT, client_cleanup);
     int res = client_init(argc, argv);
     if(res < 0) {
         perror("connect");

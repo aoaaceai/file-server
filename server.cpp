@@ -27,16 +27,10 @@ struct {
     int size;
 } poll_queue;
 
-enum work_method {
-    FROM_FD, FROM_BUF
-};
-
 struct work {
-    work_method method;
     off_t progress;
     int fd;
-    char *buf;
-    size_t buffsize;
+    size_t size;
     state next_state;
     char checksum;
 };
@@ -87,122 +81,24 @@ void queue_init() {
     add_queue(server.fd, POLLIN, ACCEPT_CONNECTION);
 }
 
-void request_write(int conn_fd, work_method method, int data_fd, char *buf, size_t buffsize, state next_state) {
-    fd_to_work[conn_fd] = {.method = method, .progress = 0, .fd = data_fd, .buf = buf, .buffsize = buffsize, .next_state = next_state, .checksum = 0};
+void request_write(int conn_fd, int data_fd, size_t size, state next_state) {
+    fd_to_work[conn_fd] = {.progress = 0, .fd = data_fd, .size = size, .next_state = next_state, .checksum = 0};
     add_queue(conn_fd, POLLOUT, WRITE_DATA);
 }
 
-void request_read(int conn_fd, int data_fd, state next_state, size_t data_size) {
-    fd_to_work[conn_fd] = {.method = FROM_FD, .progress = 0, .fd = data_fd, .buf = NULL, .buffsize = data_size, .next_state = next_state, .checksum = 0};
+void request_read(int conn_fd, int data_fd, size_t size, state next_state) {
+    fd_to_work[conn_fd] = {.progress = 0, .fd = data_fd, .size = size, .next_state = next_state, .checksum = 0};
     add_queue(conn_fd, POLLIN, READ_DATA);
 }
 
 void handle_logout(int fd) {
+    cerr << "logout from " << fd << '\n';
     if(fd_to_name.count(fd)) {
         current_users.erase(fd_to_name[fd]);
         fd_to_name.erase(fd);
     }
-    if(fd_to_work.count(fd)) delete fd_to_work[fd].buf;
     fd_to_work.erase(fd);
     close(fd);
-}
-
-void handle_write(int conn_fd) {
-    cerr << "handle write to " << conn_fd << '\n';
-    work w = fd_to_work[conn_fd];
-    fd_to_work.erase(conn_fd);
-    if(w.method == FROM_BUF) {
-        ssize_t res = write(conn_fd, w.buf + w.progress, w.buffsize - w.progress);
-        if(res < 0) {
-            perror("write to remote");
-            handle_logout(conn_fd);
-            return;
-        }
-        w.progress += res;
-    }
-    else {
-        if(w.progress == 0) {
-            off_t sz = lseek(w.fd, 0, SEEK_END);
-            w.buffsize = sz;
-            FILE *remote = fdopen(dup(conn_fd), "r+");
-            setvbuf(remote, NULL, _IONBF, 0);
-            fprintf(remote, "%lld\n", sz);
-            fclose(remote);
-        }
-        char buf[1024];
-        ssize_t res = pread(w.fd, buf, 1024, w.progress);
-        if(res < 0) {
-            perror("read from file");
-            return;
-        }
-        for(int i = 0; i < res; ++i) w.checksum ^= buf[i];
-        // cerr << "bytes read: " << res << '\n';
-        res = write(conn_fd, buf, res);
-        if(res < 0) {
-            perror("write to remote");
-            handle_logout(conn_fd);
-            return;
-        }
-        cerr << "bytes wrote: " << res << '\n';
-        w.progress += res;
-        cerr << "checksum: " << (int) w.checksum << '\n';
-    }
-    if(w.progress < w.buffsize) {
-        fd_to_work[conn_fd] = w;
-        add_queue(conn_fd, POLLOUT, WRITE_DATA);
-        cerr << conn_fd << " requested another write\n";
-
-    }
-    else {
-        w.method == FROM_FD && write(conn_fd, &w.checksum, 1);
-        delete w.buf;
-        add_queue(conn_fd, POLLIN, w.next_state);
-        cerr << conn_fd << " next state: " << w.next_state << '\n';
-    }
-}
-
-int get_filesize(int fd) {
-    char buf[20] = {0};
-    int len = 0;
-    while(true) {
-        int res = read(fd, buf+len, 1);
-        if(res != 1) return -1;
-        cerr << (int) buf[len] << ' ';
-        if(!isdigit(buf[len])) {
-            break;
-        }
-        ++len;
-    }
-    cerr << '\n';
-    return atoi(buf);
-}
-
-void handle_read(int conn_fd) {
-    cerr << "handle read for " << conn_fd << '\n';
-    work w = fd_to_work[conn_fd];
-    fd_to_work.erase(conn_fd);
-    char buf[1024];
-    ssize_t count = read(conn_fd, buf, 1024);
-    if(count < 0) {
-        cerr << "read from remote\n";
-        handle_logout(conn_fd);
-        return;
-    }
-    for(int i = 0; i < count; ++i) w.checksum ^= buf[i];
-    write(w.fd, buf, count);
-    w.progress += count;
-    if(w.progress < w.buffsize) {
-        fd_to_work[conn_fd] = w;
-        add_queue(conn_fd, POLLIN, READ_DATA);
-        cerr << conn_fd << " requested another read\n";
-    }
-    else {
-        // output checksum
-        write(conn_fd, &w.checksum, 1);
-        close(w.fd);
-        add_queue(conn_fd, POLLIN, w.next_state);
-        cerr << conn_fd << " next state: " << w.next_state << '\n';
-    }
 }
 
 void accept_connection() {
@@ -211,16 +107,16 @@ void accept_connection() {
     cerr << "fd " << fd << " accepted\n";
 }
 
+bool valid_username(string &s) {
+    return s.size() > 0;
+}
+
 void strip(string &s) {
     int len = s.size();
     for(int i = 0; i < len; ++i) if(!isalnum(s[i])) {
         s.resize(i);
         return;
     }
-}
-
-bool valid_username(string &s) {
-    return s.size() > 0;
 }
 
 void handle_login(int fd) {
@@ -252,74 +148,9 @@ void handle_login(int fd) {
     add_queue(fd, POLLIN, READ_COMMAND);
 }
 
-
 void handle_bad_request(int fd) {
     cerr << "bad request from " << fd << '\n';
     handle_logout(fd);
-}
-
-void ls(int fd) {
-    cerr << "processing ls\n";
-    vector<string> dirs;
-    for(auto entry : filesystem::directory_iterator(".")) dirs.push_back(entry.path().c_str()+2);
-    sort(dirs.begin(), dirs.end());
-    string content = to_string(dirs.size()) + '\n';
-    for(auto d : dirs) content += d + '\n';
-    size_t buffsize = content.size();
-    char *buf = new char[buffsize];
-    strcpy(buf, content.c_str());
-    request_write(fd, FROM_BUF, -1, buf, buffsize, READ_COMMAND);
-}
-
-void dump_file(int fd, char *filename) {
-    int data_fd = open(filename, O_RDONLY);
-    request_write(fd, FROM_FD, data_fd, NULL, 0, READ_COMMAND);
-}
-
-void get(int fd, char *filename) {
-    cerr << "checking " << filename << '\n';
-    struct stat buf;
-    if(stat(filename, &buf) == 0) {
-        dump_file(fd, filename);
-    }
-    else {
-        char *header = new char[40];
-        int len = sprintf(header, "%lld\n", -1LL);
-        cerr << header << '\n';
-        request_write(fd, FROM_BUF, -1, header, len, READ_COMMAND);
-    }
-}
-
-void put(int fd, char *filename, size_t filesize) {
-    cerr << "trying to put " << filename << " with size " << filesize << '\n';
-    int data_fd = open(filename, O_CREAT | O_TRUNC | O_WRONLY, 0644);
-    request_read(fd, data_fd, READ_COMMAND, filesize);
-    write(fd, "go on", 5);
-}
-
-void read_command(int fd) {
-    cerr << "reading command\n";
-    char input[512], filename[512];
-    read(fd, input, 512);
-    command choice = BAD_COMMAND;
-    int cnt = sscanf(input, "%d %[^\r\n]\n", &choice, filename);
-    cerr << "got command input " << choice << '\n';
-    switch(choice) {
-        case LS:
-        cnt == 1 ? ls(fd) : handle_bad_request(fd);
-        break;
-        case GET:
-        cnt == 2 ? get(fd, filename) : handle_bad_request(fd);
-        break;
-        case PUT:
-        if(cnt != 2) break;
-        char buf[512];
-        cnt = sprintf(buf, "%d %s\n", choice, filename);
-        put(fd, filename, atoll(input+cnt));
-        break;
-        default:
-        handle_bad_request(fd);
-    }
 }
 
 void dir_init() {
@@ -340,6 +171,123 @@ void broken_pipe(int var) {
     cerr << "SIGPIPE received\n";
 }
 
+void write_data(int fd) {
+    work w = fd_to_work[fd];
+    fd_to_work.erase(fd);
+    char buf[1024];
+    ssize_t count = pread(w.fd, buf, 1024, w.progress);
+    if(count < 0) {
+        perror("read from file");
+        handle_logout(fd);
+        return;
+    }
+    count = write(fd, buf, count);
+    if(count < 0) {
+        perror("write to remote");
+        handle_logout(fd);
+        return;
+    }
+    for(int i = 0; i < count; ++i) w.checksum ^= buf[i];
+    w.progress += count;
+    if(w.progress < w.size) {
+        fd_to_work[fd] = w;
+        add_queue(fd, POLLOUT, WRITE_DATA);
+        cerr << fd << " requested another write\n";
+    }
+    else {
+        write(fd, &w.checksum, 1);
+        add_queue(fd, POLLIN, w.next_state);
+        cerr << fd << " next state: " << w.next_state << '\n';
+    }
+}
+
+void read_data(int fd) {
+    work w = fd_to_work[fd];
+    fd_to_work.erase(fd);
+    char buf[1024];
+    ssize_t count = read(fd, buf, 1024);
+    if(count < 0) {
+        perror("read from remote");
+        handle_login(fd);
+        return;
+    }
+    for(int i = 0; i < count; ++i) w.checksum ^= buf[i];
+    write(w.fd, buf, count);
+    w.progress += count;
+    if(w.progress < w.size) {
+        fd_to_work[fd] = w;
+        add_queue(fd, POLLIN, READ_DATA);
+        cerr << fd << " requested another read\n";
+    }
+    else {
+        write(fd, &w.checksum, 1);
+        close(w.fd);
+        add_queue(fd, POLLIN, w.next_state);
+        cerr << fd << " next state: " << w.next_state << '\n';
+    }
+}
+
+void ls(int fd) {
+    vector<string> dirs;
+    for(auto dir : filesystem::directory_iterator(".")) dirs.push_back(dir.path().c_str()+2);
+    sort(dirs.begin(), dirs.end());
+    string content = to_string(dirs.size()) + '\n';
+    for(auto d : dirs) content += d + '\n';
+    write(fd, content.c_str(), content.size());
+    add_queue(fd, POLLIN, READ_COMMAND);
+}
+
+void get(int fd, char *filename) {
+    int data_fd = open(filename, O_RDONLY);
+    if(data_fd < 0) {
+        perror("open for get");
+        write(fd, "-1\n", 3);
+        add_queue(fd, POLLIN, READ_COMMAND);
+    }
+    else {
+        off_t size = lseek(data_fd, 0, SEEK_END);
+        string header = to_string(size) + '\n';
+        write(fd, header.c_str(), header.size());
+        if(size) request_write(fd, data_fd, size, READ_COMMAND);
+        else add_queue(fd, POLLIN, READ_COMMAND);
+    }
+}
+
+void put(int fd, char *filename, size_t filesize) {
+    int data_fd = open(filename, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    if(filesize == 0) {
+        cerr << "zero file size\n";
+        close(data_fd);
+        add_queue(fd, POLLIN, READ_COMMAND);
+        return;
+    }
+    request_read(fd, data_fd, filesize, READ_COMMAND);
+    write(fd, "go on\n", 6);
+}
+
+void read_command(int fd) {
+    cerr << "reading command\n";
+    char input[512] = {0}, filename[512] = {0};
+    read(fd, input, 512);
+    command choice;
+    size_t filesize;
+    int cnt = sscanf(input, "%d%s%lld", &choice, filename, &filesize);
+    cerr << "command cnt: " << cnt << '\n';
+    switch(choice) {
+        case LS:
+        cnt == 1 ? ls(fd) : handle_bad_request(fd);
+        break;
+        case GET:
+        cnt == 2 ? get(fd, filename) : handle_bad_request(fd);
+        break;
+        case PUT:
+        cnt == 3 ? put(fd, filename, filesize) : handle_bad_request(fd);
+        break;
+        default:
+        handle_bad_request(fd);
+    }
+}
+
 int main(int argc, char **argv) {
     server_init(argc, argv);
     queue_init();
@@ -347,6 +295,7 @@ int main(int argc, char **argv) {
     signal(SIGINT, server_cleanup);
     signal(SIGHUP, hangup);
     signal(SIGPIPE, broken_pipe);
+
     while(true) {
         cerr << "poll size: " << poll_queue.size << '\n';
         if(poll(poll_queue.polls, poll_queue.size, -1) < 0) perror("polling");
@@ -356,14 +305,8 @@ int main(int argc, char **argv) {
                 accept_connection();
                 continue;
             }
-            // cerr << "got event from " << poll_queue.polls[i].fd << '\n';
-            if(revents & (POLLHUP | POLLERR | POLLNVAL)) {
-                handle_logout(poll_queue.polls[i].fd);
-            }
+            if(revents & (POLLHUP | POLLERR | POLLNVAL)) handle_logout(poll_queue.polls[i].fd);
             else switch(poll_queue.states[i]) {
-                case ACCEPT_CONNECTION:
-                accept_connection();
-                break;
                 case READ_USERNAME:
                 handle_login(poll_queue.polls[i].fd);
                 break;
@@ -371,13 +314,15 @@ int main(int argc, char **argv) {
                 read_command(poll_queue.polls[i].fd);
                 break;
                 case WRITE_DATA:
-                handle_write(poll_queue.polls[i].fd);
+                write_data(poll_queue.polls[i].fd);
                 break;
                 case READ_DATA:
-                handle_read(poll_queue.polls[i].fd);
+                read_data(poll_queue.polls[i].fd);
                 break;
                 default:
-                cerr << "unrecognised state " << poll_queue.states[i] << " from " << poll_queue.polls[i].fd << '\n';
+                cerr << "unrecognised state " << poll_queue.states[i] << '\n';
+                handle_bad_request(poll_queue.polls[i].fd);
+                break;
             }
             remove_queue(i--);
         }
