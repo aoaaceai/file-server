@@ -1,3 +1,6 @@
 test*
 a.out
 .vscode
+*_dir
+server
+client
