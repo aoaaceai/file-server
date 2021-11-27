@@ -213,13 +213,14 @@ void handle_command() {
 }
 
 void client_cleanup(int var) {
-    cerr << "SIGINT received\n";
+    cerr << "terminating signal received\n";
     close_connection(0);
 }
 
 int main(int argc, char **argv) {
     dir_init();
     signal(SIGINT, client_cleanup);
+    signal(SIGPIPE, client_cleanup);
     int res = client_init(argc, argv);
     if(res < 0) {
         perror("connect");
